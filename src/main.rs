@@ -1,73 +1,122 @@
-//  ************************************************************  Prelude contents  ************************************************************
+#![allow(non_snake_case)]
 
+use chrono::prelude::*;     //A convenience module appropriate for glob imports
+use crossterm::{    
+    event::{self, Event as CEvent, KeyCode},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
+use rand::{distributions::Alphanumeric, prelude::*};
+use serde::{Deserialize, Serialize};    //For serializing and deserializing
+use std::fs;    //Basic methods to manipulate the contents of the local filesystem
+use std::io;    //Input/Output
+use std::sync::mpsc;    //This module provides message-based communication over channels
+use std::thread;
+use std::time::{Duration, Instant};   //TIME
+use thiserror::Error;
+use tui::{      //Framework for terminal
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Span, Spans},
+    widgets::{
+        Block, BorderType, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Tabs,
+    },
+    Terminal,
+};
 
-//      std::marker::{Copy, Send, Sized, Sync, Unpin}, marker traits that indicate fundamental properties of types.
-//      std::ops::{Drop, Fn, FnMut, FnOnce}, various operations for both destructors and overloading ().
-//      std::mem::drop, a convenience function for explicitly dropping a value.
-//      std::boxed::Box, a way to allocate values on the heap.
-//      std::borrow::ToOwned, the conversion trait that defines to_owned, the generic method for creating an owned type from a borrowed type.
-//      std::clone::Clone, the ubiquitous trait that defines clone, the method for producing a copy of a value.
-//      std::cmp::{PartialEq, PartialOrd, Eq, Ord}, the comparison traits, which implement the comparison operators and are often seen in trait bounds.
-//      std::convert::{AsRef, AsMut, Into, From}, generic conversions, used by savvy API authors to create overloaded methods.
-//      std::default::Default, types that have default values.
-//      std::iter::{Iterator, Extend, IntoIterator, DoubleEndedIterator, ExactSizeIterator}, iterators of various kinds.
-//      std::option::Option::{self, Some, None}, a type which expresses the presence or absence of a value. This type is so commonly used, its variants are also exported.
-//      std::result::Result::{self, Ok, Err}, a type for functions that may succeed or fail. Like Option, its variants are exported as well.
-//      std::string::{String, ToString}, heap-allocated strings.
-//      std::vec::Vec, a growable, heap-allocated vector.
+const DB_PATH: &str = "./data/db.json";
 
+#[derive(Error, Debug)]     //some implementing error handling
+pub enum Error {
 
+    #[error("error reading the DB file: {0}")]
+    ReadDBError(#[from] io::Error),
+    #[error("error parsing the DB file: {0}")]
+    ParseDBError(#[from] serde_json::Error),
 
-//  ************************************************************        Parse       ************************************************************
+}
 
+#[derive(Serialize, Deserialize, Clone)]
+struct Car {
+    
+    id: usize,
+    name: String,
+    model: String,
+    engine: String,
+    category: String,
+    age: usize,
+    created_at: DateTime<Utc>,
 
-//          pub fn parse<F>(&self) -> Result<F, <F as FromStr>::Err>
+}
 
-//      Parses this string slice into another type.
+enum Event<I> {     //Data structure for input events
 
-//      Because parse is so general, it can cause problems with type inference. 
-//      As such, parse is one of the few times you’ll see the syntax affectionately known as the ‘turbofish’: ::<>. 
-//      This helps the inference algorithm understand specifically which type you’re trying to parse into.
+    Input(I),
+    Tick,
 
-//      parse can parse into any type that implements the FromStr trait.
+}
 
+enum MenuItem {
 
-use std::io;
-use rand::Rng;
-use std::cmp::Ordering;
+    Home,
+    Cars,
 
-fn main() {
-    println!("Guess the number!");
+}
 
-    let secret_number = rand::thread_rng().gen_range(1..101);
+impl From<MenuItem> for usize {             //This enables us to use the enum within 
+    fn from(input: MenuItem) -> usize {     // the Tabs component of TUI to highlight the 
+        match input {                       // currently selected tab in the menu
 
-    println!("The secret number is: {}", secret_number);
+            MenuItem::Home => 0,
+            MenuItem::Cars => 1,
 
-    loop {
+        }
+    }
+}
 
-        println!("Please input your guess.");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
 
-        let mut guess = String::new();  //changeable    &   let guess = 5; -> immutable
+//****************************************************************** Setup to create an input loop ******************************************************************
 
-        io::stdin()  //standard input handler
-            .read_line(&mut guess)
-            .expect("Failed to read line");  //Resault: OK || Err; if Err -> expect show error message
+    enable_raw_mode().expect("\nCan run in raw mode\n");    //which eliminates the need to wait for an Enter by the user to react to the input
+    
+    let (tx, rx) = mpsc::channel();
+    let tick_rate = Duration::from_millis(200);
 
-        let guess: u32 = match guess.trim().parse() {
-            Ok(num) => num,
-            Err(_) => continue,
-        };
+    thread::spawn(move || {
 
-        println!("You guessed: {}", guess);
+        let mut last_tick = Instant::now();
 
-        match guess.cmp(&secret_number) {
-            Ordering::Less => println!("Too small!"),
-            Ordering::Greater => println!("Too big!"),
-            Ordering::Equal => {
-                println!("You win!");
-                break;
+        loop {      //input loop
+
+            //This logic is spawned in another thread because we need our main thread to render the application.
+            //This way, our input loop doesn’t block the rendering
+
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0));
+
+            if event::poll(timeout).expect("poll works") {
+                if let CEvent::Key(key) = event::read().expect("can read events") {
+                    tx.send(Event::Input(key)).expect("can send events");
+                }
             }
+
+            if last_tick.elapsed() >= tick_rate {
+                if let Ok(_) = tx.send(Event::Tick) {
+                    last_tick = Instant::now();
+                }
+            }
+
         }
 
-    }
+    });
+
+    let stdout = io::stdout();                      //We defined a CrosstermBackend using stdout and used it in a TUI Terminal,
+    let backend = CrosstermBackend::new(stdout);    // clearing it initially and implicitly checking that everything works.
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+//******************************************************************************************************************************************************************
+
 }
